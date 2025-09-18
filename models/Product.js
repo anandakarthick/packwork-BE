@@ -56,7 +56,7 @@ const Products = sequelize.define(
         "Pasting-glue",
         "Other",
         "Stitching-wires",
-        "Dye",
+        "Die",
         "Stereo",
         "Corrugated",
         "Pasting"

@@ -53,7 +53,7 @@ export default {
           "Pasting-glue",
           "Other",
           "Stitching-wires",
-          "Dye",
+          "Die",
           "Stereo",
           "Corrugated",
           "Pasting"
