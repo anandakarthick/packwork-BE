@@ -7,6 +7,8 @@ import GlueSpecification from "../models/GlueSpecification.js";
 import WireSpecification from "../models/WireSpecification.js";
 import DieSpecification from "../models/DieSpecification.js";
 import ProductDieSpecification from "../models/ProductDieSpecification.js";
+import BoardSpecification from "../models/BoardSpecification.js";
+import { Op } from "sequelize";
 
 const createGlueSpec = async ({
   productVersionId,
@@ -86,11 +88,9 @@ export const subcategoryHandlers = {
     t,
     reel_specifications,
     layer_specifications,
-    glue_specifications,
   }) => {
     let reelSpec = null;
     let layerSpecs = [];
-    let glueSpecs = [];
 
     if (reel_specifications) {
       reelSpec = await ReelSpecification.create(
@@ -121,8 +121,10 @@ export const subcategoryHandlers = {
     }
     return { reelSpec, layerSpecs };
   },
+
   "Corrugation-glue": createGlueSpec,
   "Pasting-glue": createGlueSpec,
+
   "Stitching-wires": async ({
     productVersionId,
     company_id,
@@ -148,10 +150,69 @@ export const subcategoryHandlers = {
     }
     return { wireSpec };
   },
+
   Die: createDieSpec,
+
+  SKU: async ({
+    productVersionId,
+    company_id,
+    created_by,
+    updated_by,
+    t,
+    board_specification,
+    layer_specifications,
+  }) => {
+    let boardSpec = null;
+    let layerSpecs = [];
+
+    if (board_specification) {
+      boardSpec = await BoardSpecification.create(
+        {
+          id: uuidv4(),
+          product_version_id: productVersionId,
+          company_id,
+          created_by,
+          updated_by,
+          ...board_specification,
+        },
+        { transaction: t }
+      );
+    }
+
+    if (layer_specifications && Array.isArray(layer_specifications)) {
+      layerSpecs = await ProductVersionLayerSpecification.bulkCreate(
+        layer_specifications.map((layer) => ({
+          id: uuidv4(),
+          product_version_id: productVersionId,
+          company_id,
+          created_by,
+          updated_by,
+          ...layer,
+        })),
+        { transaction: t, returning: true }
+      );
+    }
+
+    return { boardSpec, layerSpecs };
+  },
 };
 
-function getSubcategorySpecifications(subcategory) {
+function getSubcategorySpecifications(subcategory, category = null) {
+  if (category === "SKU") {
+    return [
+      {
+        model: BoardSpecification,
+        as: "BoardSpecification",
+        required: false,
+      },
+      {
+        model: ProductVersionLayerSpecification,
+        as: "LayerSpecifications",
+        required: false,
+      },
+    ];
+  }
+
   switch (subcategory) {
     case "Reels":
       return [
@@ -214,9 +275,13 @@ export const createProduct = async (req, res) => {
       glue_specifications,
       wire_specifications,
       die_specifications,
+      board_specification,
     } = req.body;
 
+    const prefix = category === "SKU" ? "SKU#" : "PRO#";
+
     const lastProduct = await Products.findOne({
+      where: { category },
       order: [["created_at", "DESC"]],
       attributes: ["product_id"],
       transaction: t,
@@ -225,11 +290,14 @@ export const createProduct = async (req, res) => {
 
     let nextNumber = 1;
     if (lastProduct?.product_id) {
-      const lastNum = parseInt(lastProduct.product_id.replace("PRO#", ""), 10);
+      const lastNum = parseInt(lastProduct.product_id.replace(prefix, ""), 10);
       if (!isNaN(lastNum)) nextNumber = lastNum + 1;
     }
 
-    const formattedProductId = `PRO#${String(nextNumber).padStart(3, "0")}`;
+    const formattedProductId = `${prefix}${String(nextNumber).padStart(
+      3,
+      "0"
+    )}`;
     const productId = uuidv4();
 
     const product = await Products.create(
@@ -266,9 +334,20 @@ export const createProduct = async (req, res) => {
       },
       { transaction: t }
     );
+
     let subcategoryData = null;
 
-    if (subcategoryHandlers[subcategory]) {
+    if (category === "SKU") {
+      subcategoryData = await subcategoryHandlers["SKU"]({
+        productVersionId: productVersion.id,
+        company_id,
+        created_by,
+        updated_by: created_by,
+        t,
+        board_specification,
+        layer_specifications,
+      });
+    } else if (subcategoryHandlers[subcategory]) {
       subcategoryData = await subcategoryHandlers[subcategory]({
         productVersionId: productVersion.id,
         company_id,
@@ -291,6 +370,7 @@ export const createProduct = async (req, res) => {
       data: {
         product,
         productVersion,
+        category,
         subcategory,
         subcategoryData,
       },
@@ -310,8 +390,20 @@ export const getAllProducts = async (req, res) => {
     const limit = parseInt(req.query.limit) || 20;
     const offset = (page - 1) * limit;
 
+    const { categoryFilter } = req.query;
+
+    const whereCondition = { is_deleted: false };
+
+    if (categoryFilter) {
+      if (categoryFilter === "sku") {
+        whereCondition.category = "sku";
+      } else if (categoryFilter === "product") {
+        whereCondition.category = { [Op.ne]: "sku" };
+      }
+    }
+
     const { count, rows: products } = await Products.findAndCountAll({
-      where: { is_deleted: false },
+      where: whereCondition,
       limit,
       offset,
       order: [["created_at", "DESC"]],
@@ -327,7 +419,10 @@ export const getAllProducts = async (req, res) => {
               as: "ProductVersions",
               where: { is_active: true },
               required: false,
-              include: getSubcategorySpecifications(product.subcategory),
+              include: getSubcategorySpecifications(
+                product.subcategory,
+                product.category
+              ),
             },
           ],
         });
@@ -360,7 +455,7 @@ export const getProductById = async (req, res) => {
     const { id } = req.params;
     const basicProduct = await Products.findOne({
       where: { id, is_deleted: false },
-      attributes: ["id", "subcategory"],
+      attributes: ["id", "subcategory", "category"],
     });
 
     if (!basicProduct) {
@@ -369,6 +464,7 @@ export const getProductById = async (req, res) => {
         message: "Product not found",
       });
     }
+
     const product = await Products.findOne({
       where: { id, is_deleted: false },
       include: [
@@ -377,7 +473,10 @@ export const getProductById = async (req, res) => {
           as: "ProductVersions",
           where: { is_active: true },
           required: false,
-          include: getSubcategorySpecifications(basicProduct.subcategory),
+          include: getSubcategorySpecifications(
+            basicProduct.subcategory,
+            basicProduct.category
+          ),
         },
       ],
     });
@@ -407,6 +506,7 @@ export const updateProduct = async (req, res) => {
           as: "ProductVersions",
           include: [
             { model: ReelSpecification, as: "ReelSpecification" },
+            { model: BoardSpecification, as: "BoardSpecification" },
             {
               model: ProductVersionLayerSpecification,
               as: "LayerSpecifications",
@@ -444,9 +544,7 @@ export const updateProduct = async (req, res) => {
       min_stock_level,
       reorder_level,
       status,
-      company_id,
-      created_by,
-      ProductVersion,
+      ProductVersions: ProductVersionPayload,
     } = req.body;
 
     await product.update(
@@ -467,111 +565,46 @@ export const updateProduct = async (req, res) => {
       { transaction: t }
     );
 
-    if (ProductVersion && Array.isArray(ProductVersion)) {
-      for (let versionPayload of ProductVersion) {
+    if (Array.isArray(ProductVersionPayload)) {
+      for (const versionPayload of ProductVersionPayload) {
         const version = product.ProductVersions.find(
           (v) => v.id === versionPayload.id
         );
+        if (!version) continue;
 
-        if (version) {
-          await version.update(
-            {
-              version_name: versionPayload.version_name,
-              description: versionPayload.description,
-            },
-            { transaction: t }
-          );
+        await version.update(
+          {
+            version_name: versionPayload.version_name,
+            description: versionPayload.description,
+          },
+          { transaction: t }
+        );
 
-          if (versionPayload.ReelSpecification) {
-            await version.ReelSpecification?.update(
+        if (versionPayload.BoardSpecification) {
+          if (version.BoardSpecification) {
+            await version.BoardSpecification.update(
+              { ...versionPayload.BoardSpecification },
+              { transaction: t }
+            );
+          } else {
+            await BoardSpecification.create(
               {
-                reel_width: versionPayload.ReelSpecification.reel_width,
-                units: versionPayload.ReelSpecification.units,
+                product_version_id: version.id,
+                ...versionPayload.BoardSpecification,
               },
               { transaction: t }
             );
           }
+        }
 
-          if (
-            versionPayload.LayerSpecifications &&
-            Array.isArray(versionPayload.LayerSpecifications)
-          ) {
-            for (let layerPayload of versionPayload.LayerSpecifications) {
-              const layer = version.LayerSpecifications.find(
-                (l) => l.id === layerPayload.id
-              );
-              if (layer) {
-                await layer.update(
-                  {
-                    gsm: layerPayload.gsm,
-                    bf: layerPayload.bf,
-                    color_id: layerPayload.color_id,
-                    flute_type: layerPayload.flute_type,
-                    weight: layerPayload.weight,
-                    bursting_strength: layerPayload.bursting_strength,
-                  },
-                  { transaction: t }
-                );
-              }
-            }
-          }
+        if (Array.isArray(versionPayload.LayerSpecifications)) {
+          for (const layerPayload of versionPayload.LayerSpecifications) {
+            const layer = version.LayerSpecifications.find(
+              (l) => l.id === layerPayload.id
+            );
 
-          if (versionPayload.GlueSpecification) {
-            if (version.GlueSpecification) {
-              await version.GlueSpecification.update(
-                {
-                  glue_type: versionPayload.GlueSpecification.glue_type,
-                  expriry_date: versionPayload.GlueSpecification.expiry_date,
-                },
-                { transaction: t }
-              );
-            }
-          }
-
-          if (versionPayload.WireSpecification) {
-            if (version.WireSpecification) {
-              await version.WireSpecification.update(
-                {
-                  wire_type: versionPayload.WireSpecification.wire_type,
-                },
-                { transaction: t }
-              );
-            }
-          }
-
-       
-          if (
-            versionPayload.ProductDieSpecification &&
-            Array.isArray(versionPayload.ProductDieSpecification)
-          ) {
-            for (let pdsPayload of versionPayload.ProductDieSpecification) {
-              const productDieSpec = version.ProductDieSpecification.find(
-                (pds) => pds.id === pdsPayload.id
-              );
-
-              if (productDieSpec) {
-                await productDieSpec.update(
-                  {
-                    die_id: pdsPayload.die_id || productDieSpec.die_id,
-                  },
-                  { transaction: t }
-                );
-
-                if (
-                  productDieSpec.DieSpecification &&
-                  pdsPayload.DieSpecification
-                ) {
-                  await productDieSpec.DieSpecification.update(
-                    {
-                      board_length: pdsPayload.DieSpecification.board_length,
-                      board_width: pdsPayload.DieSpecification.board_width,
-                      impressions: pdsPayload.DieSpecification.impressions,
-                      ups: pdsPayload.DieSpecification.ups,
-                    },
-                    { transaction: t }
-                  );
-                }
-              }
+            if (layer) {
+              await layer.update({ ...layerPayload }, { transaction: t });
             }
           }
         }
@@ -612,6 +645,8 @@ export const deleteProduct = async (req, res) => {
               as: "ProductDieSpecification",
               include: [{ model: DieSpecification, as: "DieSpecification" }],
             },
+
+            { model: BoardSpecification, as: "BoardSpecification" },
           ],
         },
       ],
@@ -633,6 +668,13 @@ export const deleteProduct = async (req, res) => {
 
       if (version.ReelSpecification) {
         await version.ReelSpecification.update(
+          { is_active: false },
+          { transaction: t }
+        );
+      }
+
+      if (version.BoardSpecification) {
+        await version.BoardSpecification.update(
           { is_active: false },
           { transaction: t }
         );
@@ -660,6 +702,7 @@ export const deleteProduct = async (req, res) => {
           { transaction: t }
         );
       }
+
       if (
         version.ProductDieSpecification &&
         version.ProductDieSpecification.length > 0
@@ -681,7 +724,8 @@ export const deleteProduct = async (req, res) => {
 
     return res.json({
       success: true,
-      message: "Product, its versions, and specifications deleted successfully",
+      message:
+        "Product, its versions, BoardSpecification, and related specifications deleted successfully",
     });
   } catch (error) {
     await t.rollback();
@@ -689,6 +733,64 @@ export const deleteProduct = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to delete product",
+    });
+  }
+};
+
+export const getDieProducts = async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    const { categoryFilter } = req.query;
+
+    const whereCondition = { is_deleted: false };
+
+    whereCondition.subcategory = "Die";
+    if (categoryFilter) {
+      if (categoryFilter === "product") {
+        whereCondition.category = "product";
+      } else if (categoryFilter === "sku") {
+        whereCondition.category = { [Op.ne]: "product" };
+      }
+    }
+
+    const { count, rows: products } = await Products.findAndCountAll({
+      where: whereCondition,
+      limit,
+      offset,
+      order: [["created_at", "DESC"]],
+      include: [
+        {
+          model: ProductVersions,
+          as: "ProductVersions",
+          required: true,
+          where: {
+            is_active: true,
+          },
+          include: getSubcategorySpecifications("Die", whereCondition.category),
+        },
+      ],
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        products,
+        pagination: {
+          total: count,
+          page,
+          pages: Math.ceil(count / limit),
+          limit,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching die products:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch die products",
     });
   }
 };
