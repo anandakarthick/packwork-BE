@@ -32,7 +32,7 @@ const ProductVersionLayerSpecification = sequelize.define(
       allowNull: true,
     },
     flute_type: {
-      type: DataTypes.FLOAT,
+      type: DataTypes.STRING,
       allowNull: true,
     },
     color_id: {
